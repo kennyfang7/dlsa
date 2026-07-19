@@ -1,0 +1,185 @@
+run:
+  name: baseline_pca_v1        # used in run logs / MLflow
+  seed: 42                     # single global seed; set torch/numpy/random from it
+  mode: backtest               # backtest | paper | live  (same code path, different router)
+
+wiring:                        # dotted import paths; load_config().resolved(k) returns the CLASS OBJECT
+  engine_class:       dlsa.backtest.engine.Engine          # test_min.yaml MUST match these exactly
+  factor_model_class: dlsa.factors.pca.PCAFactorModel      # (identity-asserted, Hardened Test 9)
+  policy_class:       dlsa.policy.mlp.MLPPolicy
+  overlay_classes:    [dlsa.overlays.regime.RegimeOverlay,
+                       dlsa.overlays.news.NewsGate,
+                       dlsa.overlays.crowding.CrowdingOverlay]
+  cost_model_class:   dlsa.backtest.costs.LinearImpactCost
+
+dates:
+  start: 2005-01-03            # first TRADING date; data lookback extends earlier as needed
+  end: 2026-06-30              # B7 Option A (owner decision, 2026-07-17): set to the latest VALIDATED
+                               # lake date at Session 1 (≈ 2026-06-30) — no unclassified gap between
+                               # sample end and live start; V2's live prior anchors near live
+  calendar: NYSE
+  holdout_start: 2024-07-01    # frozen param M4 — DESIGN HOLDOUT (still the final 24 months; moved
+                               # 2023-01-01 → 2024-07-01 with the B7 end-date decision). No design
+                               # iteration, parameter choice, or gate tuning may consume dates >= this
+                               # until the single pre-registered Phase-2 run. The engine REFUSES to
+                               # score beyond it in mode: backtest only (M4 mode scope, 2026-07-17)
+                               # unless run with --holdout-release (which is logged, loudly).
+
+universe:
+  source: pit_sp500            # only option in v1; resolves via get_universe(date)
+  min_price: 5.0               # raw close filter, applied point-in-time
+  min_dollar_volume: 2.0e+6    # 21d median, point-in-time (sign in exponent required: PyYAML parses 2.0e6 as a STRING)
+
+factor_model:
+  kind: pca                    # pca | ipca | fama_french
+  n_factors: 5                 # frozen-parameters table, param F1
+  refit_frequency: monthly     # walk-forward; eigenvectors/Γ from window ending BEFORE refit date
+  lookback_days: 252
+  warm_start: true             # frozen param F4 (IPCA only): initialize Γ from the previous refit's
+                               # converged Γ. Cuts ALS iterations AND reduces refit-to-refit subspace
+                               # rotation. No effect for kind: pca.
+
+signal:
+  kind: conv_transformer       # conv_transformer | mamba (mamba only after baseline works)
+  window_days: 30              # L — frozen param S1
+  conv_channels: [8, 8]
+  transformer_layers: 1
+  d_model: 32
+  ensemble_seeds: [0, 1, 2, 3, 4]   # frozen param V3 — deployed signal = equal-weight mean over
+                               # these seeds; ONE registry version, ONE V1 trial. run.seed still
+                               # seeds everything else (data order, torch init for non-signal nets).
+  shrinkage:                   # frozen param V5 — EB/James–Stein toward 0, BETWEEN signal and policy
+    enabled: true
+    window_days: 252           # trailing estimation window for λ
+    refit: monthly             # F3 cadence; λ versioned with the model artifact, logged daily
+    fixed_lambda: null         # frozen param V5 (amended 2026-07-17, B6): null = the seed-dispersion
+                               # estimator over the V3 ensemble (default path, Config rule 1). A float
+                               # pins λ — legitimate only where the estimator is unidentifiable (1 seed).
+
+policy:
+  kind: mlp
+  hidden: [32]
+  cost_rate_bps: 5             # c in the training objective — INSIDE the loss, frozen param P1
+  objective: net_sharpe        # mean net return / std, contiguous windows only, never shuffled
+  aim_portfolio: {enabled: false, kappa: null}
+                               # frozen param V6 — DORMANT until the post-G2 trigger. kappa (partial-
+                               # adjustment rate) frozen from V4 CPCV evidence at adoption (gate G3.7),
+                               # never tuned live. Default matches old behavior per Config rule 1.
+
+training:
+  train_years: 4
+  val_years: 1                 # validation block strictly AFTER train
+  embargo_days: 30             # gap >= signal window between train/val and val/test
+  retrain_frequency: quarterly # frozen param T1
+  early_stopping_patience: 10  # on the EMBARGOED validation block only
+
+overlays:
+  regime:
+    enabled: true
+    n_states: 3
+    multipliers: {calm: 1.0, normal: 0.7, stressed: 0.25}   # frozen param O1
+    multiplier_mode: expected  # frozen param O8: Σ p(state)·m(state) over FILTERED state probs.
+                               # `argmax` is NOT permitted — boundary flips produce repeated ~75%
+                               # turnover demands that leave the C2 cap permanently binding.
+    refit_frequency: monthly   # walk-forward fit only
+    features: [spx_ret, realized_vol_21d, vix_close, hy_oas]
+    feature_lag_days: {vix_close: 1, hy_oas: 1}             # frozen param D3 — FRED publication lag
+  news_gate:
+    enabled: true
+    source: filings_8k         # v1
+    lookback_days: 3           # frozen param O2
+    non_gating_items: ["5.03", "5.07", "7.01", "8.01", "9.01"]  # frozen param O2 (amended):
+                               # a filing gates only if its items are NOT a subset of these.
+                               # Unfiltered 8-Ks turned earnings weeks (item 2.02 clusters) into a
+                               # rolling blackout of much of the universe.
+    disposition: freeze        # frozen param O7: freeze | flatten. `freeze` = hold, block new risk
+                               # (|target| <= |current|, same sign). `flatten` (weight:=0) is the OLD
+                               # behavior and force-liquidated into post-news spreads.
+  crowding:
+    enabled: true
+    floor: 0.3                 # min capital multiplier — frozen param O3 (O9 keeps these bounds: ONE multiplier)
+    inputs: [signal_autocorr_decay, short_interest, days_to_cover, live_backtest_sharpe_gap]
+                               # frozen param O9 adds days_to_cover (FINRA SI ÷ 21d median share volume)
+    composite: {smoothing: ewma, halflife_days: 10, hysteresis_band: 0.05}
+                               # frozen param O9 — the O8 whipsaw pattern applied to crowding. FINRA-derived
+                               # inputs join on PUBLICATION vintage only, never same-day (hardened Test 16)
+
+constraints:
+  max_name_weight: 0.03        # frozen param C1
+  max_sector_weight: 0.15
+  daily_turnover_cap: 0.25     # L1, fraction of gross — frozen param C2
+  turnover_cap_exempts_risk_reduction: true   # frozen param C5: turnover attributable to a DECREASE
+                               # in overlay_multiplier bypasses the cap. Without this, an O1
+                               # calm→stressed transition (~75% one-day turnover) is throttled into a
+                               # 3-day glide path through the crash the overlay exists to escape.
+  min_order_notional: 100.0    # frozen param C6 — below this, orders are SKIPPED, never rounded up
+  max_positions: null          # frozen param C7 — null = derive floor(deployed gross / C6), split
+                               # per side, ranked by |signal|. Set explicitly only to override.
+  capital_floor: 25000.0       # frozen param C8 — mode: live raises below this (paper unrestricted)
+  dollar_neutral: true
+  beta_neutral: false          # v2
+
+costs:                         # applied in backtest accounting (training uses policy.cost_rate_bps)
+  half_spread_bps: 3
+  impact_bps_per_1pct_adv: 2
+  short_borrow_bps_annual: 50  # frozen param X2 — on short-leg market value
+
+execution:                     # frozen param E6 — what actually produces a close(t+1) fill
+  order_type: limit
+  time_in_force: cls           # ON-CLOSE, submitted evening of t. A plain `day` order fills near the
+                               # OPEN, silently invalidating close-to-close attribution in exactly the
+                               # direction that flatters a mean-reversion signal.
+  limit_band_pct: 0.01         # protective band around close(t) — ALPHA flow only (E8, 2026-07-17)
+  risk_flow_order_type: moc    # frozen param E8 (2026-07-17, B8): risk_reduction / kill_switch flows
+                               # go market-on-close, NO band — a sell LOC at close(t)−1% cannot fill on
+                               # a >1% gap-down close, so a banded de-risk leaves the book net long
+                               # into the crash. Fill certainty is the objective of an emergency order.
+  journal_path: data_lake/journal.sqlite   # frozen param E2 — SQLite WAL, not the DuckDB lake
+
+risk:                          # kill-switch thresholds — frozen params K1–K3
+  max_drawdown_halt: 0.10
+  drawdown_basis: hwm_since_arming   # frozen param K1 (amended): running high-water mark of strategy
+                                     # equity since the last (re-)arming. "10%" had no basis before.
+  sharpe_gap_halt: {threshold: 2.5, window_days: 120, confirm_consecutive_weekly: 2}
+                                     # frozen param K2 (recalibrated 2026-07-18, N2 owner decision): the gap
+                                     # is measured against the V2 DECAYED live prior, not the raw backtest.
+                                     # Old 60d/1.5 was <1 SE of the estimator (≈65%/yr false halts); 120d/2.5
+                                     # ≈ 1.7 SE ⇒ ≈9%/yr, breach confirmed on 2 consecutive weekly evals.
+                                     # confirm_consecutive_weekly schema default = 1 (old behavior, Config rule 1).
+  live_prior_haircut: 0.40           # frozen param V2 — expected live Sharpe = (1 − h) × accepted
+                                     # backtest net Sharpe; K2 and G3.4 reference THIS number
+  max_gross: 1.0
+  max_net: 0.02
+
+data:
+  source_priority: [yfinance, stooq, alpaca]   # frozen param D5 — canonical modeling value when
+                                               # sources agree within D1's 50bps. Previously unpinned:
+                                               # a later backfill could silently shift modeled history.
+  extra_tickers: [SPY]                         # N8 (2026-07-18): the prices ingest includes SPY though it
+                                               # is never a universe member — spx_ret / realized_vol_21d
+                                               # derive from it (page 05 §5); same two-source validation
+  delisting_return: {bankrupt: -0.30, delisted: -0.30, acquired: 0.0}   # frozen param D6
+  vendor_intake_dir: data_lake/vendor_intake/  # frozen param D7 — staging quarantine for any NEW source.
+                                               # Not reachable by training/selection until that source's
+                                               # CPCV ablation gate passes (hardened Test 20).
+
+evaluation:                    # frozen params V1, V4 — added 2026-07-15
+  trial_registry: runs/backtests/   # append-only; canonical config hashes; NEVER reset. Path is
+                                    # relative to logging.lake_dir, so the test lake gets its own.
+  report_deflated_sharpe: true      # BacktestResult.deflated_sharpe from all-time distinct hashes
+  selection:                        # consumed only by `make select` (dlsa/selection/, V4)
+    method: cpcv
+    groups: 8
+    test_groups: 2                  # ⇒ 28 splits, 7 paths
+    purge_days: 60
+    embargo_days: 10
+    output: runs/selection/         # never runs/backtests/ — selection runs are not trials
+
+allocation:                    # frozen param C9 — DORMANT. v1 is single-sleeve; null means the allocator
+  sleeves: null                # module may not even be imported. Activating multi-sleeve requires C9's
+                               # five trigger conditions (incl. G2.8's measured OOS correlation ≤ 0.3 and
+                               # capital ≥ 2×C8); combiner is FIXED 50/50 risk weights, never learned.
+
+logging:
+  lake_dir: data_lake/
+  mlflow: true

@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: leakage-tests
+        name: leakage tests
+        stages: [push]
+        language: system
+        entry: uv run pytest tests/test_lookahead_bias.py -v
+        pass_filenames: false

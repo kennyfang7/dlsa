@@ -1,0 +1,24 @@
+run:   {name: test_min, seed: 42, mode: backtest}
+wiring:                        # IDENTICAL to backtest.yaml — asserted by Hardened Test 9 via
+  engine_class:       dlsa.backtest.engine.Engine        # load_config(...).resolved(k) identity.
+  factor_model_class: dlsa.factors.pca.PCAFactorModel    # Only PARAMS may differ between the two
+  policy_class:       dlsa.policy.mlp.MLPPolicy          # configs — never the classes, or a "fast
+  overlay_classes:    [dlsa.overlays.regime.RegimeOverlay,   # test path" could shelter a leak.
+                       dlsa.overlays.news.NewsGate,
+                       dlsa.overlays.crowding.CrowdingOverlay]
+  cost_model_class:   dlsa.backtest.costs.LinearImpactCost
+dates: {start: 2018-01-02, end: 2023-12-29, calendar: BDAY, holdout_start: null}  # BDAY = plain business days, matches the tz-aware bdate_range fixtures; engine trades the intersection of this range and the supplied index; no holdout on synthetic data
+universe: {source: fixture_all, min_price: 0.0, min_dollar_volume: 0.0}
+       # fixture_all: get_universe() over the synthetic tickers, still PIT-shaped
+factor_model: {kind: pca, n_factors: 5, refit_frequency: monthly, lookback_days: 126}
+signal: {kind: conv_transformer, window_days: 30, conv_channels: [4], transformer_layers: 1, d_model: 16, ensemble_seeds: [42], shrinkage: {enabled: true, window_days: 126, refit: yearly, fixed_lambda: 0.5}}   # 1 seed for speed (params may shrink, classes may not); shrinkage stays ON — shrink() carries leakage invariants the suite must exercise. fixed_lambda: 0.5 (B6, 2026-07-17) because the V5 seed-dispersion estimator is unidentifiable with one seed; the shrink-only and no-future-influence invariants are still exercised
+policy: {kind: mlp, hidden: [16], cost_rate_bps: 5, objective: net_sharpe}
+training: {train_years: 2, val_years: 1, embargo_days: 30, retrain_frequency: yearly, early_stopping_patience: 3}
+overlays:
+  regime:   {enabled: false}    # canary tests isolate the alpha path; overlay tests hit build_portfolio directly
+  news_gate: {enabled: false}
+  crowding: {enabled: false}
+constraints: {max_name_weight: 0.05, max_sector_weight: 1.0, daily_turnover_cap: 1.0, turnover_cap_exempts_risk_reduction: true, min_order_notional: 0.0, max_positions: null, capital_floor: 0.0, dollar_neutral: true, beta_neutral: false}
+costs: {half_spread_bps: 0, impact_bps_per_1pct_adv: 0, short_borrow_bps_annual: 0}   # zero costs = most leakage-sensitive
+risk: {max_drawdown_halt: 1.0, sharpe_gap_halt: {threshold: 99, window_days: 60}, max_gross: 1.0, max_net: 0.05}
+logging: {lake_dir: /tmp/dlsa_test_lake, mlflow: false}

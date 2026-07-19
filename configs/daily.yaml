@@ -1,0 +1,34 @@
+run:
+  name: daily
+  mode: dry                    # dry | paper | live — `make daily` passes MODE; live additionally requires DLSA_CONFIRM_LIVE=yes
+
+models:                        # explicit registry versions — never "latest"
+  factor: pca/v0              # updated by hand (or by the retrain job) with a change-log entry
+  signal: conv_transformer/v0
+  policy: mlp/v0
+
+data:
+  lake_dir: data_lake/
+  ingest_sources: [yfinance, stooq, alpaca, edgar_8k, fred, finra]   # finra added 2026-07-16 (O9 / page 02
+                               # seam fix: O6 required the feed since 07-12 with no ingest source)
+  extra_tickers: [SPY]         # N8 (2026-07-18): SPY ingested nightly though not a member — the regime
+                               # features have no live input without it (page 05 §5)
+  validation: strict           # any ingest validation failure ⇒ K3 halt (fail closed)
+
+overlays: {regime: true, news_gate: true, crowding: true}   # on/off only; parameters come from the deployed model config + frozen params
+
+shadow:                        # frozen param V6 — dormant until the post-G2 trigger. When enabled, the
+  enabled: false               # daily job computes BOTH books: baseline is traded; the aim book is
+                               # journaled with book='shadow' and counterfactual X1/X2 fills. A shadow
+                               # order can never reach submit() — hardened Test 17 asserts at the boundary.
+
+risk:                          # kill-switch thresholds — MUST equal backtest.yaml's risk block; a config-consistency test asserts equality
+  max_drawdown_halt: 0.10
+  sharpe_gap_halt: {threshold: 2.5, window_days: 120, confirm_consecutive_weekly: 2}   # K2 recalibrated 2026-07-18 (N2) — parity with backtest.yaml enforced by the consistency test
+  live_prior_haircut: 0.40     # frozen param V2 — parity with backtest.yaml enforced by the same consistency test
+  max_gross: 1.0
+  max_net: 0.02
+
+alerts:
+  digest: [email]
+  halt_alert: [email]

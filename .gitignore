@@ -1,3 +1,10 @@
+# DLSA project-specific
+data_lake/
+quarantine/
+mlruns/
+models/
+!data_lake/raw/sp500_pit_membership.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -130,10 +137,6 @@ __pypackages__/
 # Celery stuff
 celerybeat-schedule
 celerybeat.pid
-
-# Claude
-CLAUDE.md
-.claude
 
 # Redis
 *.rdb
