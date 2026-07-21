@@ -66,6 +66,15 @@ data_lake/     # Parquet files via DuckDB (gitignored) + journal.sqlite (SQLite 
   evaluation run. `--holdout-release` enforces this once built; until then,
   treat it as a standing rule, not a check that catches you.
 
+## Docs canonicality (decided 2026-07-21)
+
+`/docs/` is the source of truth for all contracts, frozen parameters, and
+acceptance criteria. `PHASE_CHECKLIST.md` (repo root) is the canonical build
+checklist. All changes go through PRs — never edit Notion first. Notion pages
+01–11 are narrative archives; sync them same-day from the repo after any PR
+merges. When this file and `docs/04-frozen-parameters.md` disagree, the frozen
+parameters win.
+
 ## Conventions
 
 - Python 3.11, type hints on public functions, `ruff` enforces style (don't
