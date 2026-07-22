@@ -16,6 +16,7 @@ dependencies = [
     "statsmodels",
     "hmmlearn",
     "yfinance",
+    "pandas-market-calendars",
     "alpaca-py",
     "sec-edgar-downloader",
     "fredapi",

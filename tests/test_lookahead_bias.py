@@ -119,8 +119,11 @@ class TestNoiseCanary:
 # ----------------------------------------------------------------------------
 
 class TestPITUniverse:
-    pytestmark = pytest.mark.xfail(strict=False)
+    # P0.1 (2026-07-22): universe module landed; class-level xfail removed.
+    # test_backtest_only_trades_members_as_of_each_date still xfails individually
+    # because it depends on run_backtest (P0.10, not yet built).
 
+    @pytest.mark.xfail(strict=False, reason="run_backtest not implemented (P0.10)")
     def test_backtest_only_trades_members_as_of_each_date(self, noise_prices):
         """Every position on date t must be in the universe ON date t."""
         result = run_backtest(prices=noise_prices, config="configs/test_min.yaml")

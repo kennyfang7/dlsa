@@ -75,13 +75,29 @@ Un-xfail order = build order; one module per session; guarded-folder sessions
 end with `make test-leakage`; when creating a NEW file in a guarded folder,
 read a sibling first (path rules trigger on read).
 
-- [ ] 🔵 **P0.1 Calendar + PIT universe** — `get_universe(date)` per
+- [x] 🔵 **P0.1 Calendar + PIT universe** — `get_universe(date)` per
   `docs/01-interface-contracts.md`; append-only membership log per
   `docs/02-data-lake-schema.md`; un-xfail `TestPITUniverse`. Universe
   membership comes from this function ONLY, everywhere.
-- [ ] 🔵 **P0.2 identifier_map v0** — append-only validity ranges, never edits;
+  *2026-07-22:* fja05680 CSV ingested to `data_lake/universe/universe_membership.parquet`;
+  `TestPITUniverse` tests 2 (delisted) + 3 (deterministic) green;
+  `test_backtest_only_trades_members_as_of_each_date` still individually
+  xfail'd — awaits `run_backtest` from P0.10.
+- [x] 🔵 **P0.2 identifier_map v0** — append-only validity ranges, never edits;
   built from fja05680 symbols + `symbol_change` actions; the loader
   hard-depends on it (B11)
+  *2026-07-22:* `dlsa/data/identifier_map.py` ships v0 (fja05680 path):
+  deterministic `security_id = SID_<sha256(ticker)[:12]>` assigned at first
+  sight; `build_identifier_map_v0()` writes `data_lake/identifier_map/
+  identifier_map.parquet` (append-only, docs/02 schema), idempotent via
+  content-hash `recorded_at`; `resolve_security_id(source_id, asof)` honors
+  validity ranges with NaT = still-current and later-`recorded_at`-wins on
+  corrections. Real CSV smoke-test: 1202 unique tickers → 503 current + 699
+  exited (survivorship signal intact; ENRNQ closes 2001-11-26 as expected).
+  `symbol_change` unification is reserved for P0.3 (parameter present,
+  raises `NotImplementedError` — extension will land as pure append).
+  Tests: `tests/test_identifier_map.py` 20/20 green; full suite 30 passed,
+  33 xfailed (no regression).
 - [ ] 🔵→🟣review **P0.3 Price ingest + validation** 2003→present — two-source
   cross-check; quarantine never zero-fill; stale-bar check (N7); SPY though
   not a member (N8); disputed membership fail-closed (N12); store RAW prices +
