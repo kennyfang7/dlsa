@@ -104,6 +104,36 @@ read a sibling first (path rules trigger on read).
   actions, never persist adjusted. G0.1/G0.1b/G0.2 measured here;
   delisted-subset coverage reported separately (that's where survivorship bias
   hides; triggers the buy-vs-free data decision)
+  - [x] **P0.3a Validation gate + schemas + returns + symbol_change** (2026-07-23).
+    Shipped ahead of network ingest:
+    * `dlsa/data/schemas.py` — pandera `PRICES_SCHEMA`, `CORPORATE_ACTIONS_SCHEMA`,
+      column-name constants, `ValidationReport` dataclass.
+    * `dlsa/data/validation.py::validate_frame(df, source, lake_dir=None, corporate_actions=None)`
+      — write-gate for the lake. All six checks land: duplicate (ticker,date),
+      negative price/volume, D2 |ret| > 60% w/o matching split, D1 cross-source
+      > 50bps (consults other-source parquets already in the lake — no-op when
+      absent), N7 stale-bar (identical OHLCV vs prior session while ≥ 80% of
+      the frame moved), N1 adjustment-consistency
+      (`pct_change(close_adj) ≈ compute_returns(close_raw, actions)` within 1e-8).
+    * `dlsa/data/returns.py::compute_returns` — implemented (P0.5 pulled forward
+      so N1 has something to cross-check). Splits back-adjust the pre-split
+      window; dividends back-adjust by (1 − div/close_before); NaN prices
+      produce NaN returns at both `t` and `t+1`; |ret| > 60% without a recorded
+      split ⇒ NaN (D2 unrecorded-split trap). `TestReturnCorrectness` and
+      `TestReturnCorrectnessHardened` un-xfailed and green.
+    * `dlsa/data/identifier_map.py` — `symbol_change` extension: `corporate_actions`
+      rows with `type == 'symbol_change'` unify old/new tickers under the
+      OLDER ticker's `security_id` via APPENDED rows landing 1s after v0's
+      `recorded_at` (later-recorded_at-wins). Idempotent; extends preserve
+      relative ordering under a merge shift. The old `NotImplementedError`
+      path is gone.
+    * Tests: `tests/test_validation.py` 13/13 new, `tests/test_identifier_map.py`
+      24/24 green (5 new `TestSymbolChangeExtension`), full suite **50 passed,
+      30 xfailed** (no regression; 3 new pass, 3 fewer xfailed).
+    * Deferred to a follow-up P0.3b: real network ingest (yfinance + stooq
+      wired end-to-end per user's preference), N12 cross-source universe
+      dispute, coverage reporter (G0.1 / G0.1b / G0.2), symbol_change corp-
+      action *ingest* (as opposed to the map extension, which is done).
 - [ ] 🔵 **P0.4 FINRA short-interest ingest** — publication-vintage table per
   `docs/02-data-lake-schema.md`; Test 16 ships now, Tests 20–21 ship with
   the suite

@@ -234,7 +234,7 @@ class TestCausalNormalization:
 # ----------------------------------------------------------------------------
 
 class TestReturnCorrectness:
-    pytestmark = pytest.mark.xfail(strict=False)
+    # P0.3 (2026-07-23): compute_returns landed; class-level xfail removed.
 
     def test_split_produces_no_fake_return(self, split_prices):
         """
@@ -443,7 +443,7 @@ class TestUniverseNoFutureFiltering:
 # ----------------------------------------------------------------------------
 
 class TestReturnCorrectnessHardened:
-    pytestmark = pytest.mark.xfail(strict=False)
+    # P0.3 (2026-07-23): compute_returns landed; class-level xfail removed.
 
     def test_unrecorded_split_is_detected_not_swallowed(self):
         """The existing split test covers a split WITH an action row. The

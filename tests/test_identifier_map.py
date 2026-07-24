@@ -184,15 +184,6 @@ class TestBuildV0:
         # New rows exist with a strictly-later recorded_at.
         assert after["recorded_at"].max() > before["recorded_at"].max()
 
-    def test_corporate_actions_parameter_reserved_for_p03(self, tmp_path):
-        csv = _write_csv(tmp_path / "src.csv", [("2020-01-02", ["AAA"])])
-        with pytest.raises(NotImplementedError, match="P0.3"):
-            build_identifier_map_v0(
-                csv,
-                lake_dir=tmp_path,
-                corporate_actions=pd.DataFrame({"type": ["symbol_change"]}),
-            )
-
     def test_missing_csv_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             build_identifier_map_v0(tmp_path / "nope.csv", lake_dir=tmp_path)
@@ -270,3 +261,154 @@ class TestAvailability:
         csv = _write_csv(tmp_path / "src.csv", [("2020-01-02", ["AAA"])])
         build_identifier_map_v0(csv, lake_dir=tmp_path)
         assert identifier_map_available(lake_dir=tmp_path) is True
+
+
+# ----------------------------------------------------------------------------
+# symbol_change extension (P0.3, 2026-07-23)
+# ----------------------------------------------------------------------------
+
+
+class TestSymbolChangeExtension:
+    """`corporate_actions` extends the map by APPEND so old & new tickers
+    resolve to the same security_id on and after the change date."""
+
+    def _seed_with_both_tickers(self, tmp_path):
+        # Old ticker present up to change date; new ticker present after.
+        csv = _write_csv(
+            tmp_path / "src.csv",
+            [
+                ("2022-01-03", ["OLD", "AAA"]),
+                ("2022-06-08", ["OLD", "AAA"]),
+                ("2022-06-09", ["NEW", "AAA"]),
+                ("2023-01-02", ["NEW", "AAA"]),
+            ],
+        )
+        return csv
+
+    def test_symbol_change_unifies_new_ticker_to_old_id(self, tmp_path):
+        csv = self._seed_with_both_tickers(tmp_path)
+        actions = pd.DataFrame(
+            {
+                "ticker": ["OLD"],
+                "date": [pd.Timestamp("2022-06-09")],
+                "type": ["symbol_change"],
+                "ratio": [None],
+                "detail": ["NEW"],
+            }
+        )
+        build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+
+        # Resolving NEW on/after change date returns OLD's security_id.
+        old_sid = security_id_for_ticker("OLD")
+        new_sid_direct = security_id_for_ticker("NEW")
+        assert old_sid != new_sid_direct
+
+        resolved_new = resolve_security_id(
+            "NEW", pd.Timestamp("2023-01-02"), lake_dir=tmp_path
+        )
+        assert resolved_new == old_sid
+
+        resolved_old = resolve_security_id(
+            "OLD", pd.Timestamp("2022-06-08"), lake_dir=tmp_path
+        )
+        assert resolved_old == old_sid
+
+    def test_symbol_change_arrow_form_in_detail(self, tmp_path):
+        csv = self._seed_with_both_tickers(tmp_path)
+        actions = pd.DataFrame(
+            {
+                "ticker": ["ignored"],
+                "date": [pd.Timestamp("2022-06-09")],
+                "type": ["symbol_change"],
+                "ratio": [None],
+                "detail": ["OLD→NEW"],
+            }
+        )
+        build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+        assert resolve_security_id(
+            "NEW", pd.Timestamp("2023-01-02"), lake_dir=tmp_path
+        ) == security_id_for_ticker("OLD")
+
+    def test_symbol_change_does_not_edit_prior_rows(self, tmp_path):
+        """Append-only: the pre-existing v0 rows for NEW must remain, so the
+        history of what we knew when is preserved (docs/02)."""
+        csv = self._seed_with_both_tickers(tmp_path)
+        build_identifier_map_v0(csv, lake_dir=tmp_path)
+
+        import pyarrow.parquet as pq
+
+        before = pq.read_table(
+            tmp_path / "identifier_map" / "identifier_map.parquet"
+        ).to_pandas()
+        original_new = before[before["source_id"] == "NEW"].iloc[0]
+
+        actions = pd.DataFrame(
+            {
+                "ticker": ["OLD"],
+                "date": [pd.Timestamp("2022-06-09")],
+                "type": ["symbol_change"],
+                "ratio": [None],
+                "detail": ["NEW"],
+            }
+        )
+        build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+
+        after = pq.read_table(
+            tmp_path / "identifier_map" / "identifier_map.parquet"
+        ).to_pandas()
+
+        # Original v0 row for NEW is preserved bit-for-bit.
+        matches = after[
+            (after["source_id"] == "NEW")
+            & (after["security_id"] == original_new["security_id"])
+            & (after["recorded_at"] == original_new["recorded_at"])
+        ]
+        assert len(matches) == 1
+
+        # A new row exists mapping NEW → OLD's security_id.
+        appended = after[
+            (after["source_id"] == "NEW")
+            & (after["security_id"] == security_id_for_ticker("OLD"))
+        ]
+        assert len(appended) == 1
+        assert appended.iloc[0]["recorded_at"] > original_new["recorded_at"]
+
+    def test_symbol_change_idempotent_rebuild(self, tmp_path):
+        csv = self._seed_with_both_tickers(tmp_path)
+        actions = pd.DataFrame(
+            {
+                "ticker": ["OLD"],
+                "date": [pd.Timestamp("2022-06-09")],
+                "type": ["symbol_change"],
+                "ratio": [None],
+                "detail": ["NEW"],
+            }
+        )
+        p1 = build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+        bytes_1 = Path(p1).read_bytes()
+        p2 = build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+        assert Path(p2).read_bytes() == bytes_1
+
+    def test_non_symbol_change_actions_are_ignored(self, tmp_path):
+        """Split and dividend rows must not affect the identifier_map — they
+        belong to price-adjustment logic in `dlsa/data/returns.py`."""
+        csv = _write_csv(tmp_path / "src.csv", [("2020-01-02", ["AAA"])])
+        actions = pd.DataFrame(
+            {
+                "ticker": ["AAA", "AAA"],
+                "date": [pd.Timestamp("2020-06-01"), pd.Timestamp("2020-06-02")],
+                "type": ["split", "dividend"],
+                "ratio": [4.0, 0.5],
+                "detail": [None, None],
+            }
+        )
+        build_identifier_map_v0(csv, lake_dir=tmp_path, corporate_actions=actions)
+
+        import pyarrow.parquet as pq
+
+        df = pq.read_table(
+            tmp_path / "identifier_map" / "identifier_map.parquet"
+        ).to_pandas()
+        # Only the single v0 row for AAA should exist.
+        assert len(df) == 1
+        assert df.iloc[0]["source_id"] == "AAA"

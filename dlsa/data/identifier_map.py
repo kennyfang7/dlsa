@@ -13,11 +13,17 @@ Each unique ticker in the fja05680 PIT membership CSV gets:
   - one validity range spanning its first→last appearance in the CSV.
     A ticker present on the latest snapshot has valid_to = NaT (still current).
 
-The optional `corporate_actions` parameter is reserved for P0.3 (price + corp
-actions ingest). When symbol_change rows are available, they extend the map
-by APPEND — adding new validity ranges so old and new tickers share a single
-security_id. v0 ships the fja05680-only path; P0.3 adds symbol_change handling
-without editing any pre-existing row.
+symbol_change extension (P0.3)
+------------------------------
+When `corporate_actions` is provided, rows with `type == 'symbol_change'`
+unify old and new tickers under a SINGLE security_id via APPENDED validity
+ranges (docs/02 append-only rule). Encoding:
+  - `ticker`  = old symbol (pre-change)
+  - `detail`  = new symbol (post-change), or 'OLD→NEW' / 'OLD->NEW'
+  - `date`    = effective date of the change
+The canonical security_id is the OLDER row's — resolving the new ticker on
+or after the change date returns the old row's security_id via the
+"later-recorded_at-wins" rule in `resolve_security_id`.
 
 Storage (docs/02)
 -----------------
@@ -122,21 +128,14 @@ def build_identifier_map_v0(
     ----------
     membership_csv : path to the fja05680 CSV (columns: date, tickers).
     lake_dir : override active lake dir (tests).
-    corporate_actions : reserved for P0.3; must be None for v0. When P0.3
-        lands, symbol_change rows will unify old/new tickers under a single
-        security_id via appended validity ranges.
+    corporate_actions : optional. When provided, rows with
+        `type == 'symbol_change'` extend the map by APPEND — unifying old
+        and new tickers under a single security_id (see module docstring).
 
     Returns
     -------
     Path to the parquet file.
     """
-    if corporate_actions is not None:
-        raise NotImplementedError(
-            "identifier_map v0 accepts only the fja05680 path; corporate_actions "
-            "support (symbol_change unification) lands in P0.3 as an append-only "
-            "extension"
-        )
-
     csv_path = Path(membership_csv)
     if not csv_path.exists():
         raise FileNotFoundError(f"membership CSV not found: {csv_path}")
@@ -188,31 +187,122 @@ def build_identifier_map_v0(
             }
         )
 
-    df = pd.DataFrame(rows)
+    v0_df = pd.DataFrame(rows)
 
     # Deterministic recorded_at derived from the CSV content hash — same CSV
     # → same timestamp across re-runs, so re-ingests are bit-reproducible.
     content_hash = _sha256_file(csv_path)[:16]
-    recorded_at = pd.Timestamp("2000-01-01", tz="UTC") + pd.Timedelta(
+    base_recorded_at = pd.Timestamp("2000-01-01", tz="UTC") + pd.Timedelta(
         seconds=int(content_hash, 16) % (10 * 365 * 86400)
     )
-    df["recorded_at"] = recorded_at
+    v0_df["recorded_at"] = base_recorded_at
+
+    # symbol_change extension: unify (old, new) tickers under the OLDER
+    # ticker's security_id. New rows land 1s after v0's `recorded_at` so
+    # `resolve_security_id` picks the unified id on and after the change
+    # date (the "later recorded_at wins" rule).
+    sc_df = _build_symbol_change_rows(
+        corporate_actions,
+        recorded_at=base_recorded_at + pd.Timedelta(seconds=1),
+    )
+
+    df = pd.concat([v0_df, sc_df], ignore_index=True) if not sc_df.empty else v0_df
 
     if dest.exists():
         existing = pq.read_table(dest).to_pandas()
         if _signature_set(existing) == _signature_set(df):
-            # Nothing new: v0 idempotent no-op.
+            # Nothing new: idempotent no-op.
             return dest
-        # Extension: append with a strictly-later recorded_at (docs/02).
-        df["recorded_at"] = max(
-            df["recorded_at"].iloc[0],
-            existing["recorded_at"].max() + pd.Timedelta(seconds=1),
+        # Extension: shift all new rows uniformly so they land strictly
+        # after every existing row while preserving the v0 → sc ordering.
+        delta = (
+            existing["recorded_at"].max()
+            + pd.Timedelta(seconds=1)
+            - base_recorded_at
         )
+        if delta > pd.Timedelta(0):
+            v0_df["recorded_at"] = v0_df["recorded_at"] + delta
+            if not sc_df.empty:
+                sc_df["recorded_at"] = sc_df["recorded_at"] + delta
+            df = (
+                pd.concat([v0_df, sc_df], ignore_index=True)
+                if not sc_df.empty
+                else v0_df
+            )
         df = pd.concat([existing, df], ignore_index=True)
 
     table = pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False)
     pq.write_table(table, dest)
     return dest
+
+
+# ---------------------------------------------------------------------------
+# symbol_change parsing helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_symbol_change(row: pd.Series) -> tuple[str, str]:
+    """Return `(old_ticker, new_ticker)` from a corporate_actions row.
+
+    Accepted encodings (all rows must be `type == 'symbol_change'`):
+      - `ticker` = old symbol, `detail` = new symbol (canonical).
+      - `detail` = 'OLD→NEW' or 'OLD->NEW' (arrow form; overrides `ticker`).
+
+    Returns `('', '')` if either side is missing — the caller skips such rows.
+    """
+    old = str(row.get("ticker", "")).strip()
+    detail = str(row.get("detail", "")).strip()
+    for sep in ("→", "->"):
+        if sep in detail:
+            parts = [x.strip() for x in detail.split(sep, 1)]
+            if len(parts) == 2 and all(parts):
+                return parts[0], parts[1]
+    if old and detail:
+        return old, detail
+    return "", ""
+
+
+def _build_symbol_change_rows(
+    corporate_actions: pd.DataFrame | None,
+    recorded_at: pd.Timestamp,
+) -> pd.DataFrame:
+    """Build the append rows that unify old/new tickers per symbol_change.
+
+    Each row points the NEW source_id at the OLDER ticker's canonical
+    security_id, with `valid_from = change_date` and `valid_to = NaT`.
+    """
+    empty_cols = ["security_id", "source", "source_id", "valid_from", "valid_to"]
+    if corporate_actions is None or len(corporate_actions) == 0:
+        return pd.DataFrame(columns=empty_cols)
+    if "type" not in corporate_actions.columns:
+        return pd.DataFrame(columns=empty_cols)
+
+    sc = corporate_actions[corporate_actions["type"] == "symbol_change"]
+    if sc.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    rows: list[dict] = []
+    for _, r in sc.iterrows():
+        old_ticker, new_ticker = _parse_symbol_change(r)
+        if not old_ticker or not new_ticker:
+            continue
+        if "date" not in r or pd.isna(r["date"]):
+            continue
+        change_date = pd.to_datetime(r["date"]).date()
+        rows.append(
+            {
+                "security_id": security_id_for_ticker(old_ticker),
+                "source": "ticker",
+                "source_id": new_ticker,
+                "valid_from": change_date,
+                "valid_to": pd.NaT,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+    out = pd.DataFrame(rows)
+    out["recorded_at"] = recorded_at
+    return out
 
 
 def _signature_set(df: pd.DataFrame) -> set[tuple]:
